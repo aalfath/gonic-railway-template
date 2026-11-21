@@ -28,17 +28,21 @@ fi
 # Percent-encode every byte, so any password survives the form post.
 urlencode() { printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n' | sed 's/../%&/g'; }
 
-# post PATH BODYFILE [COOKIE] -> BusyBox wget's response headers (first response only matters).
-# The body goes in a file (-O /dev/null, --post-file), so the password never shows in the process list.
+# post PATH BODYFILE [COOKIE] -> raw HTTP response headers. BusyBox wget follows
+# gonic's 303 as another POST and loses the session cookie, so speak HTTP/1.0
+# over BusyBox nc instead. The body comes from a file and printf is a shell
+# builtin, so the password never shows in the process list.
 post() {
-  if [ -n "${3:-}" ]; then
-    wget -q -S -T 10 -O /dev/null --header "Cookie: $3" --post-file "$2" "$SETUP$1" 2>&1 || true
-  else
-    wget -q -S -T 10 -O /dev/null --post-file "$2" "$SETUP$1" 2>&1 || true
-  fi
+  {
+    printf 'POST %s HTTP/1.0\r\nHost: 127.0.0.1\r\n' "$1"
+    printf 'Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %s\r\n' "$(wc -c <"$2" | tr -d ' ')"
+    [ -n "${3:-}" ] && printf 'Cookie: %s\r\n' "$3"
+    printf '\r\n'
+    cat "$2"
+  } | nc -w 10 127.0.0.1 "$SETUP_PORT" 2>/dev/null | sed '/^\r*$/q' || true
 }
-first_location() { grep -i -m1 '^ *location:' | sed 's/^ *[Ll]ocation: *//' | tr -d '\r'; }
-first_cookie() { grep -i -m1 '^ *set-cookie:' | sed 's/^ *[Ss]et-[Cc]ookie: *//; s/;.*//' | tr -d '\r'; }
+first_location() { grep -i -m1 '^location:' | sed 's/^[Ll]ocation: *//' | tr -d '\r'; }
+first_cookie() { grep -i -m1 '^set-cookie:' | sed 's/^[Ss]et-[Cc]ookie: *//; s/;.*//' | tr -d '\r'; }
 
 # login USER PASSWORD -> writes headers to $WORK/login.h
 login() {
