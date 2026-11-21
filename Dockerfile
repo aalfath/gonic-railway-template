@@ -3,10 +3,6 @@
 # CHANGELOG.md entry: a merge to main notifies everyone who deployed the template.
 FROM sentriz/gonic:v0.23.0@sha256:7b2298d905149ecb7e57cdd3bf7a40082758b9bda2e24454b41c17c99bf25e8f
 
-# curl is only used by the start script, on loopback, to replace gonic's
-# built-in admin/admin login with GONIC_ADMIN_PASSWORD on a fresh volume.
-RUN apk add --no-cache curl
-
 # Everything gonic writes lives under /data (the Railway volume):
 #   /data/gonic.db    SQLite database (users, play counts, settings, sessions)
 #   /data/music       your music library (one folder per album)

@@ -16,6 +16,8 @@ PORT="${PORT:-4747}"
 MARKER="$DATA_DIR/.railway-admin-password-set"
 SETUP_PORT=4799
 SETUP="http://127.0.0.1:$SETUP_PORT"
+WORK="$(mktemp -d)"
+trap 'rm -r "$WORK"' EXIT
 
 mkdir -p "$DATA_DIR" "$GONIC_MUSIC_PATH" "$GONIC_PODCAST_PATH" "$GONIC_PLAYLISTS_PATH" "$GONIC_CACHE_PATH"
 if [ ! -w "$DATA_DIR" ]; then
@@ -23,19 +25,27 @@ if [ ! -w "$DATA_DIR" ]; then
   exit 1
 fi
 
-# curl reads form fields from stdin (-K -), so the password never shows in the
-# process list. Escape for curl's config syntax.
-cfg_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+# Percent-encode every byte, so any password survives the form post.
+urlencode() { printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n' | sed 's/../%&/g'; }
 
-# login USER PASSWORD JAR -> prints where gonic redirects (…/admin/home on success)
-login() {
-  u="$(cfg_escape "$1")"; p="$(cfg_escape "$2")"
-  curl -sS --max-time 10 -o /dev/null -w '%{redirect_url}' -c "$3" -b "$3" \
-    -X POST "$SETUP/admin/login_do" -K - <<CFG
-data-urlencode = "username=$u"
-data-urlencode = "password=$p"
-CFG
+# post PATH BODYFILE [COOKIE] -> BusyBox wget's response headers (first response only matters).
+# The body goes in a file (-O /dev/null, --post-file), so the password never shows in the process list.
+post() {
+  if [ -n "${3:-}" ]; then
+    wget -q -S -T 10 -O /dev/null --header "Cookie: $3" --post-file "$2" "$SETUP$1" 2>&1 || true
+  else
+    wget -q -S -T 10 -O /dev/null --post-file "$2" "$SETUP$1" 2>&1 || true
+  fi
 }
+first_location() { grep -i -m1 '^ *location:' | sed 's/^ *[Ll]ocation: *//' | tr -d '\r'; }
+first_cookie() { grep -i -m1 '^ *set-cookie:' | sed 's/^ *[Ss]et-[Cc]ookie: *//; s/;.*//' | tr -d '\r'; }
+
+# login USER PASSWORD -> writes headers to $WORK/login.h
+login() {
+  printf 'username=%s&password=%s' "$(urlencode "$1")" "$(urlencode "$2")" >"$WORK/login.b"
+  post /admin/login_do "$WORK/login.b" >"$WORK/login.h"
+}
+login_ok() { [ "$(first_location <"$WORK/login.h")" = "/admin/home" ]; }
 
 set_admin_password() {
   password="${GONIC_ADMIN_PASSWORD:-}"
@@ -46,42 +56,38 @@ set_admin_password() {
 
   GONIC_LISTEN_ADDR="127.0.0.1:$SETUP_PORT" GONIC_SCAN_AT_START_ENABLED=false \
     GONIC_SCAN_WATCHER_ENABLED=false GONIC_SCAN_INTERVAL=0 GONIC_HTTP_LOG=false \
-    gonic >/tmp/gonic-setup.log 2>&1 &
+    gonic >"$WORK/setup.log" 2>&1 &
   pid=$!
 
   i=0
-  until curl -fsS --max-time 2 "$SETUP/ping" >/dev/null 2>&1; do
+  until wget -q -T 2 -O /dev/null "$SETUP/ping" 2>/dev/null; do
     i=$((i + 1))
     if [ "$i" -ge 120 ] || ! kill -0 "$pid" 2>/dev/null; then
-      log "setup instance did not start:"; cat /tmp/gonic-setup.log
+      log "setup instance did not start:"; cat "$WORK/setup.log"
       kill "$pid" 2>/dev/null || true
       return 1
     fi
     sleep 0.5
   done
 
-  jar="$(mktemp)"; rc=1
-  case "$(login admin admin "$jar")" in
-    */admin/home)
-      p="$(cfg_escape "$password")"
-      curl -sS --max-time 10 -o /dev/null -c "$jar" -b "$jar" \
-        -X POST "$SETUP/admin/change_password_do?user=admin" -K - <<CFG
-data-urlencode = "password_one=$p"
-data-urlencode = "password_two=$p"
-CFG
-      : >"$jar"
-      case "$(login admin "$password" "$jar")" in
-        */admin/home) log "set the password of user 'admin' from GONIC_ADMIN_PASSWORD"; rc=0 ;;
-        *) log "ERROR: the new admin password did not work after changing it" ;;
-      esac
-      ;;
-    *)
-      # admin/admin no longer works: someone already changed it (or renamed admin).
-      log "the default admin/admin login is already gone; leaving accounts alone"
-      rc=0
-      ;;
-  esac
-  rm "$jar"
+  rc=1
+  login admin admin
+  if login_ok; then
+    cookie="$(first_cookie <"$WORK/login.h")"
+    enc="$(urlencode "$password")"
+    printf 'password_one=%s&password_two=%s' "$enc" "$enc" >"$WORK/pw.b"
+    post "/admin/change_password_do?user=admin" "$WORK/pw.b" "$cookie" >/dev/null
+    login admin "$password"
+    if login_ok; then
+      log "set the password of user 'admin' from GONIC_ADMIN_PASSWORD"; rc=0
+    else
+      log "ERROR: the new admin password did not work after changing it"
+    fi
+  else
+    # admin/admin no longer works: the password (or the user name) was already changed.
+    log "the default admin/admin login is already gone; leaving accounts alone"
+    rc=0
+  fi
 
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
@@ -97,6 +103,7 @@ if [ ! -e "$MARKER" ]; then
   fi
 fi
 
+rm -r "$WORK"; trap - EXIT
 export GONIC_LISTEN_ADDR="0.0.0.0:$PORT"
 log "starting gonic on $GONIC_LISTEN_ADDR"
 exec gonic "$@"
